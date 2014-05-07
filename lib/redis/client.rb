@@ -6,17 +6,18 @@ class Redis
   class Client
 
     DEFAULTS = {
-      :url => lambda { ENV["REDIS_URL"] },
-      :scheme => "redis",
-      :host => "127.0.0.1",
-      :port => 6379,
-      :path => nil,
-      :timeout => 5.0,
-      :password => nil,
-      :db => 0,
-      :driver => nil,
-      :id => nil,
-      :tcp_keepalive => 0
+        :url => lambda { ENV["REDIS_URL"] },
+        :scheme => "redis",
+        :host => "127.0.0.1",
+        :port => 6379,
+        :path => nil,
+        :timeout => 5.0,
+        :password => nil,
+        :db => 0,
+        :driver => nil,
+        :id => nil,
+        :tcp_keepalive => 0,
+        :auto_reconnect => true
     }
 
     def options
@@ -217,14 +218,19 @@ class Redis
     end
 
     def io
-      yield
-    rescue TimeoutError => e1
-      # Add a message to the exception without destroying the original stack
-      e2 = TimeoutError.new("Connection timed out")
-      e2.set_backtrace(e1.backtrace)
-      raise e2
-    rescue Errno::ECONNRESET, Errno::EPIPE, Errno::ECONNABORTED, Errno::EBADF, Errno::EINVAL => e
-      raise ConnectionError, "Connection lost (%s)" % [e.class.name.split("::").last]
+      sleep_interval = 5
+      loop do
+        begin
+          return yield
+        rescue TimeoutError
+          p "Connection timed out-------------Reconnecting"
+          sleep sleep_interval
+        rescue Errno::ECONNRESET, Errno::EPIPE, Errno::ECONNABORTED, Errno::EBADF, Errno::EINVAL => e
+          p 'Connection lost--------------Reconnecting'
+          sleep sleep_interval
+          reconnect
+        end
+      end
     end
 
     def read
@@ -267,7 +273,7 @@ class Redis
       with_reconnect(false, &blk)
     end
 
-  protected
+    protected
 
     def logging(commands)
       return yield unless @logger && @logger.debug?
@@ -285,12 +291,20 @@ class Redis
     end
 
     def establish_connection
-      @connection = @options[:driver].connect(@options.dup)
-
-    rescue TimeoutError
-      raise CannotConnectError, "Timed out connecting to Redis on #{location}"
-    rescue Errno::ECONNREFUSED
-      raise CannotConnectError, "Error connecting to Redis on #{location} (ECONNREFUSED)"
+      sleep_interval = 5
+      loop do
+        begin
+          @connection = @options[:driver].connect(@options.dup)
+          break
+          p 'Working properly.'
+        rescue TimeoutError
+          p "Timed out connecting to Redis on #{location} ------ Reconnecting."
+          sleep sleep_interval
+        rescue Errno::ECONNREFUSED
+          p "Error connecting to Redis on #{location} (ECONNREFUSED) ------- Reconnecting."
+          sleep sleep_interval
+        end
+      end
     end
 
     def ensure_connected
@@ -301,9 +315,10 @@ class Redis
 
         if connected?
           if Process.pid != @pid
+            reconnect and return if options[:auto_reconnect]
             raise InheritedError,
-              "Tried to use a connection from a child process without reconnecting. " +
-              "You need to reconnect to Redis after forking."
+                  "Tried to use a connection from a child process without reconnecting. " +
+                      "You need to reconnect to Redis after forking."
           end
         else
           connect
@@ -379,23 +394,23 @@ class Redis
       options[:driver] = _parse_driver(options[:driver]) || Connection.drivers.last
 
       case options[:tcp_keepalive]
-      when Hash
-        [:time, :intvl, :probes].each do |key|
-          unless options[:tcp_keepalive][key].is_a?(Fixnum)
-            raise "Expected the #{key.inspect} key in :tcp_keepalive to be a Fixnum"
+        when Hash
+          [:time, :intvl, :probes].each do |key|
+            unless options[:tcp_keepalive][key].is_a?(Fixnum)
+              raise "Expected the #{key.inspect} key in :tcp_keepalive to be a Fixnum"
+            end
           end
-        end
 
-      when Fixnum
-        if options[:tcp_keepalive] >= 60
-          options[:tcp_keepalive] = {:time => options[:tcp_keepalive] - 20, :intvl => 10, :probes => 2}
+        when Fixnum
+          if options[:tcp_keepalive] >= 60
+            options[:tcp_keepalive] = {:time => options[:tcp_keepalive] - 20, :intvl => 10, :probes => 2}
 
-        elsif options[:tcp_keepalive] >= 30
-          options[:tcp_keepalive] = {:time => options[:tcp_keepalive] - 10, :intvl => 5, :probes => 2}
+          elsif options[:tcp_keepalive] >= 30
+            options[:tcp_keepalive] = {:time => options[:tcp_keepalive] - 10, :intvl => 5, :probes => 2}
 
-        elsif options[:tcp_keepalive] >= 5
-          options[:tcp_keepalive] = {:time => options[:tcp_keepalive] - 2, :intvl => 2, :probes => 1}
-        end
+          elsif options[:tcp_keepalive] >= 5
+            options[:tcp_keepalive] = {:time => options[:tcp_keepalive] - 2, :intvl => 2, :probes => 1}
+          end
       end
 
       options
